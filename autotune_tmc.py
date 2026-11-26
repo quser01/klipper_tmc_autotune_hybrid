@@ -59,6 +59,43 @@ VHIGHCHM = False  # Even though we are fullstepping, we want SpreadCycle control
 
 
 TRINAMIC_DRIVERS = ["tmc2130", "tmc2208", "tmc2209", "tmc2240", "tmc2660", "tmc5160"]
+
+# Hybrid: where the spreadCycle chopper registers (tbl, toff, tpfd, hstrt, hend)
+# come from. "computed" is the analytic model of this module, "manual" means
+# hstrt/hend given in the [autotune_tmc] section or by AUTOTUNE_TMC, "measured"
+# means the driver_* values chopper-autotune saved in the [tmc...] section.
+CHOPPER_FIELDS = ("tbl", "toff", "hstrt", "hend")
+
+
+def tblank_cycles(driver_type, tbl):
+    if driver_type in ["tmc2208", "tmc2209"]:
+        return [16, 24, 32, 40][tbl]
+    return [16, 24, 36, 54][tbl]
+
+
+def check_chopper(driver_type, tbl, toff, hstrt, hend, tpfd=None):
+    """Datasheet limits of a spreadCycle chopper set, the same rules chopper-autotune
+    prunes its search with. Returns a reason string, or None when the set is valid."""
+    if not 0 <= tbl <= 3:
+        return f"tbl={tbl} out of range 0..3"
+    if not 1 <= toff <= 15:
+        return f"toff={toff} out of range 1..15 (0 disables the driver)"
+    if not 0 <= hstrt <= 7:
+        return f"hstrt={hstrt} out of range 0..7"
+    if not 0 <= hend <= 15:
+        return f"hend={hend} out of range 0..15"
+    # Effective hysteresis (hstrt+1)+(hend-3) must not exceed 16.
+    if hstrt + hend > 18:
+        return f"hstrt+hend={hstrt + hend}: effective hysteresis above 16"
+    if driver_type == "tmc2660" and hstrt + hend > 15:
+        return f"hstrt+hend={hstrt + hend}: TMC2660 allows at most 15"
+    if toff == 1 and tbl < 2:
+        return "toff=1 requires tbl >= 2 (datasheet blank time restriction)"
+    if tpfd is not None and not 0 <= tpfd <= 15:
+        return f"tpfd={tpfd} out of range 0..15"
+    return None
+
+
 PWM_FREQ_TARGETS = {
     "tmc2130": 55e3,
     "tmc2208": 55e3,
@@ -156,6 +193,17 @@ class AutotuneTMC:
         self.tbl = config.getint("tbl", default=TBL, minval=0, maxval=3)
         self.toff = config.getint("toff", default=TOFF, minval=0, maxval=15)
         self.tpfd = config.getint("tpfd", default=None, minval=0, maxval=15)
+        # Hybrid: manual hysteresis, both values or none
+        self.hstrt = config.getint("hstrt", default=None, minval=0, maxval=7)
+        self.hend = config.getint("hend", default=None, minval=0, maxval=15)
+        if (self.hstrt is None) != (self.hend is None):
+            raise config.error(
+                f"Autotune {self.name}: set both hstrt and hend, or neither"
+            )
+        # Hybrid: use the chopper registers measured by chopper-autotune
+        self.measured_chopper = config.getboolean("measured_chopper", default=False)
+        self.measured = self._read_measured(config) if self.measured_chopper else None
+        self.chopper = None  # the set last written to the driver
         self.sgt = config.getint("sgt", default=SGT, minval=-64, maxval=63)
         # TMC2240: default sg4_thrs to 0 so Klipper uses the SGT homing path,
         # which is compatible with autotune's SpreadCycle and CoolStep config.
@@ -204,6 +252,41 @@ class AutotuneTMC:
             self.cmd_AUTOTUNE_TMC,
             desc=self.cmd_AUTOTUNE_TMC_help,
         )
+
+    def _read_measured(self, config):
+        """The driver_TBL/TOFF/HSTRT/HEND/TPFD lines chopper-autotune's SAVE wrote
+        into the [tmc...] section."""
+        clash = [f for f in (*CHOPPER_FIELDS, "tpfd") if config.get(f, None)]
+        if clash:
+            raise config.error(
+                f"Autotune {self.name}: measured_chopper takes the chopper from "
+                f"[{self.driver_name}], remove {', '.join(clash)} from "
+                f"[autotune_tmc {self.name}]"
+            )
+        sec = self.tmc_section
+        values = {f: sec.getint("driver_" + f, default=None) for f in CHOPPER_FIELDS}
+        missing = [f for f, v in values.items() if v is None]
+        if missing:
+            raise config.error(
+                f"Autotune {self.name}: measured_chopper is on, but "
+                f"[{self.driver_name}] "
+                f"has no {', '.join('driver_' + f.upper() for f in missing)}. Comment "
+                f"out [autotune_tmc {self.name}], run CHOPPER_TUNE SAVE=1, then put "
+                "the section back"
+            )
+        values["tpfd"] = sec.getint("driver_tpfd", default=None)
+        reason = check_chopper(self.driver_type, **values)
+        if reason:
+            raise config.error(
+                f"Autotune {self.name}: measured chopper invalid, {reason}"
+            )
+        return values
+
+    def get_status(self, eventtime=None):
+        status = {"measured_chopper": self.measured_chopper}
+        if self.chopper is not None:
+            status.update(self.chopper)
+        return status
 
     def handle_connect(self):
         # Register aliases now that all user motor_constants are loaded
@@ -254,7 +337,8 @@ class AutotuneTMC:
         with contextlib.suppress(AttributeError):
             self.fclk = self.tmc_object.mcu_tmc.get_tmc_frequency()
         if self.fclk is None:
-            self.fclk = 12.5e6
+            # TMC2208/2209 run on a 12 MHz internal clock, the others on 12.5 MHz
+            self.fclk = 12e6 if self.driver_type in ("tmc2208", "tmc2209") else 12.5e6
         self.tune_driver()
         # Klipper's TMCCommandHelper snapshots TOFF at klippy:connect time (before
         # autotune has computed its value) for steppers using virtual/soft enable,
@@ -271,7 +355,8 @@ class AutotuneTMC:
             return
 
         def reapply_toff(eventtime):
-            self._set_driver_field("toff", self.toff)
+            if self.chopper is not None:
+                self._set_driver_field("toff", self.chopper["toff"])
 
         self.printer.reactor.register_callback(reapply_toff)
 
@@ -319,6 +404,26 @@ class AutotuneTMC:
                 self.tpfd = tpfd
             else:
                 gcmd.respond_info(f"TPFD={tpfd} out of range (0-15), ignored")
+        for field, top in (("hstrt", 7), ("hend", 15)):
+            val = gcmd.get_int(field.upper(), None)
+            if val is None:
+                continue
+            if 0 <= val <= top:
+                setattr(self, field, val)
+            else:
+                gcmd.respond_info(
+                    f"{field.upper()}={val} out of range (0-{top}), ignored"
+                )
+        if (self.hstrt is None) != (self.hend is None):
+            raise gcmd.error("Set both HSTRT and HEND the first time")
+        measured = gcmd.get_int("MEASURED", None, minval=0, maxval=1)
+        if measured is not None:
+            if measured and self.measured is None:
+                raise gcmd.error(
+                    f"No measured chopper for {self.name}: set measured_chopper: True "
+                    "in its [autotune_tmc] section and restart"
+                )
+            self.measured_chopper = bool(measured)
         sgt = gcmd.get_int("SGT", None)
         if sgt is not None:
             if sgt >= -64 and sgt <= 63:
@@ -351,6 +456,11 @@ class AutotuneTMC:
                     "(0-41), ignored"
                 )
         self.tune_driver()
+        c = self.chopper
+        gcmd.respond_info(
+            f"autotune {self.name}: chopper {c['source']} tbl={c['tbl']} "
+            f"toff={c['toff']} tpfd={c['tpfd']} hstrt={c['hstrt']} hend={c['hend']}"
+        )
 
     def tune_driver(self):
         _currents = self.tmc_cmdhelper.current_helper.get_current()
@@ -374,9 +484,10 @@ class AutotuneTMC:
                     "condition would assert continuously."
                 )
             self._set_overvoltage_vth(vth)
+        # Resolve and validate the chopper before the first write below
+        chopper = self._resolve_chopper(self.run_current)
         self._set_pwmfreq()
-        self._setup_spreadcycle()
-        self._set_hysteresis(self.run_current)
+        self._setup_spreadcycle(chopper)
         self._set_sg4thrs()
         motor = self.motor_object
         maxpwmrps = motor.maxpwmrps(
@@ -505,24 +616,73 @@ class AutotuneTMC:
         )[0]
         self._set_driver_field("pwm_freq", pwm_freq)
 
-    def _tblank_cycles(self):
-        if self.driver_type in ["tmc2208", "tmc2209"]:
-            tblank_cycles = [16, 24, 32, 40]
+    def _resolve_chopper(self, run_current):
+        """The chopper set to write, by source: measured > manual > computed. No
+        driver writes happen here, so an invalid set leaves the driver untouched."""
+        ncycles = math.ceil(self.fclk / self.pwm_freq_target)
+        if self.measured_chopper and self.measured is not None:
+            c = dict(self.measured, source="measured")
         else:
-            tblank_cycles = [16, 24, 36, 54]
-        return tblank_cycles[self.tbl]
-
-    def _set_hysteresis(self, run_current):
-        hstrt, hend = self.motor_object.hysteresis(
-            volts=self.voltage,
-            current=run_current,
-            tblank_cycles=self._tblank_cycles(),
-            toff=self.toff,
-            fclk=self.fclk,
-            extra=self.extra_hysteresis,
+            tbl, toff = self.tbl, self.toff
+            if toff == 0:
+                # About half the cycle should be taken by the two slow decay cycles
+                toff = max(min(math.ceil(max(ncycles / 4 - 24, 0) / 32), 15), 1)
+            if toff == 1 and tbl < 2:
+                # Datasheet: TOFF=1 needs a blank time of TBL>=2
+                tbl = 2
+            if self.hstrt is not None:
+                hstrt, hend, source = self.hstrt, self.hend, "manual"
+            else:
+                hstrt, hend = self.motor_object.hysteresis(
+                    volts=self.voltage,
+                    current=run_current,
+                    tblank_cycles=tblank_cycles(self.driver_type, tbl),
+                    toff=toff,
+                    fclk=self.fclk,
+                    extra=self.extra_hysteresis,
+                )
+                source = "computed"
+            c = {
+                "tbl": tbl,
+                "toff": toff,
+                "hstrt": hstrt,
+                "hend": hend,
+                "tpfd": self.tpfd,
+                "source": source,
+            }
+        if c["tpfd"] is None:
+            pfdcycles = (
+                ncycles
+                - (24 + 32 * c["toff"]) * 2
+                - tblank_cycles(self.driver_type, c["tbl"])
+            )
+            c["tpfd"] = max(0, min(15, math.ceil(pfdcycles / 128)))
+            if c["source"] == "measured" and self._has_field("tpfd"):
+                logging.warning(
+                    "autotune_tmc %s: no driver_TPFD measured, using computed tpfd=%d",
+                    self.name,
+                    c["tpfd"],
+                )
+            logging.info(
+                "autotune_tmc %s ncycles=%d pfdcycles=%d", self.name, ncycles, pfdcycles
+            )
+        reason = check_chopper(
+            self.driver_type, c["tbl"], c["toff"], c["hstrt"], c["hend"], c["tpfd"]
         )
-        self._set_driver_field("hstrt", hstrt)
-        self._set_driver_field("hend", hend)
+        if reason:
+            raise self.printer.command_error(
+                f"Autotune {self.name}: {c['source']} chopper invalid, {reason}"
+            )
+        return c
+
+    def _has_field(self, field):
+        return self.tmc_object.fields.lookup_register(field, None) is not None
+
+    def _setup_spreadcycle(self, chopper):
+        logging.info("autotune_tmc %s chopper %s", self.name, chopper)
+        for field in ("tpfd", "tbl", "toff", "hstrt", "hend"):
+            self._set_driver_field(field, chopper[field])
+        self.chopper = chopper
 
     def _set_sg4thrs(self):
         if self.tmc_object.fields.lookup_register("sg4_thrs", None) is not None:
@@ -582,29 +742,6 @@ class AutotuneTMC:
             self._set_driver_field(
                 "en_spreadcycle", True
             )  # TMC2208 use en_spreadcycle instead of en_pwm_mode
-
-    def _setup_spreadcycle(self):
-        ncycles = math.ceil(self.fclk / self.pwm_freq_target)
-        sdcycles = ncycles / 4
-        if self.toff == 0:
-            # About half the cycle should be taken by the two slow decay cycles
-            self.toff = max(min(math.ceil(max(sdcycles - 24, 0) / 32), 15), 1)
-
-        if self.toff == 1 and self.tbl == 0:
-            # blank time of 16 cycles will not work in this case
-            self.tbl = 1
-
-        pfdcycles = ncycles - (24 + 32 * self.toff) * 2 - self._tblank_cycles()
-        if self.tpfd is None:
-            self.tpfd = max(0, min(15, math.ceil(pfdcycles / 128)))
-
-        logging.info(
-            "autotune_tmc %s ncycles=%d pfdcycles=%d", self.name, ncycles, pfdcycles
-        )
-
-        self._set_driver_field("tpfd", self.tpfd)
-        self._set_driver_field("tbl", self.tbl)
-        self._set_driver_field("toff", self.toff)
 
     def _setup_coolstep(self, coolthrs):
         self._set_driver_velocity_field("tcoolthrs", coolthrs)
